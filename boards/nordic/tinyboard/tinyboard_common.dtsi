@@ -29,6 +29,22 @@
 		sw0 = &button0;
 		watchdog0 = &wdt31;
 	};
+
+	peripheral_lsw: peripheral-load-switch {
+		compatible = "regulator-fixed";
+		regulator-name = "Peripheral LSW";
+		enable-gpios = <&gpio1 10 GPIO_ACTIVE_LOW>;
+		regulator-boot-on;
+	};
+};
+
+
+dmic_dev: &pdm20 {
+	status = "okay";
+	pinctrl-0 = <&pdm20_default>;
+	pinctrl-1 = <&pdm20_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-source = "PCLK32M_HFXO";
 };
 
 &uart20 {
@@ -36,4 +52,19 @@
 	pinctrl-0 = <&uart20_default>;
 	pinctrl-1 = <&uart20_sleep>;
 	pinctrl-names = "default", "sleep";
+};
+
+&i2c21 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	pinctrl-0 = <&i2c21_default>;
+	pinctrl-1 = <&i2c21_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	adxl366: adxl366@1d {
+		compatible = "adi,adxl367";
+		reg = <0x1d>;
+		odr = <4>;
+		int1-gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>;
+	};
 };
