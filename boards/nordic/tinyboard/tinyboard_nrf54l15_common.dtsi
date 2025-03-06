@@ -31,7 +31,8 @@
 };
 
 &hfxo {
-	load-capacitors = "external";
+	load-capacitors = "internal";
+	load-capacitance-femtofarad = <12000>;
 };
 
 &regulators {

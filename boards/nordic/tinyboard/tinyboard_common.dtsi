@@ -7,11 +7,10 @@
 #include "tinyboard_nrf54l15-pinctrl.dtsi"
 
 / {
-	leds {
-		compatible = "gpio-leds";
-		led0: led_0 {
-			gpios = <&gpio1 9 GPIO_ACTIVE_HIGH>;
-			label = "Green LED 0";
+	pwmleds {
+		compatible = "pwm-leds";
+		pwm_led0: pwm_led_0 {
+			pwms = <&pwm20 0 PWM_MSEC(20) PWM_POLARITY_NORMAL>;
 		};
 	};
 
@@ -25,7 +24,7 @@
 	};
 
 	aliases {
-		led0 = &led0;
+		pwm-led0 = &pwm_led0;
 		sw0 = &button0;
 		watchdog0 = &wdt31;
 	};
@@ -64,7 +63,14 @@ dmic_dev: &pdm20 {
 	adxl366: adxl366@1d {
 		compatible = "adi,adxl367";
 		reg = <0x1d>;
-		odr = <4>;
+		odr = <5>;
 		int1-gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>;
 	};
+};
+
+&pwm20 {
+	status = "okay";
+	pinctrl-0 = <&pwm20_default>;
+	pinctrl-1 = <&pwm20_sleep>;
+	pinctrl-names = "default", "sleep";
 };
