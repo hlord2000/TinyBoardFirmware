@@ -7,6 +7,9 @@
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/hci_vs.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/led.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/init.h>
 #include "accel_service.h"
 #include <zephyr/logging/log.h>
 
@@ -24,19 +27,37 @@ static const struct bt_data sd[] = {
 /* ADXL367 device */
 static const struct device *adxl_dev = DEVICE_DT_GET(DT_NODELABEL(adxl366));
 
+/* LED Device */
+#define LED_PWM_NODE_ID	 DT_COMPAT_GET_ANY_STATUS_OKAY(pwm_leds)
+static const struct device *led_dev = DEVICE_DT_GET(LED_PWM_NODE_ID);
+
+const char *led_label[] = {
+	DT_FOREACH_CHILD_SEP_VARGS(LED_PWM_NODE_ID, DT_PROP_OR, (,), label, NULL)
+};
+
+const int num_leds = ARRAY_SIZE(led_label);
+
+/* LED configuration */
+#define MAX_BRIGHTNESS	100
+#define FADE_DELAY_MS	10
+#define NOTIFICATION_LED 0  /* Use the first LED for notification indication */
+
 /* Notification state */
 static bool notifications_enabled = false;
 static struct bt_conn *default_conn;
 
-/* Timer for inactivity detection */
-static void inactivity_timer_handler(struct k_timer *timer);
-K_TIMER_DEFINE(inactivity_timer, inactivity_timer_handler, NULL);
+/* Timer for sensor polling - 10 Hz (100ms interval) */
+#define POLLING_INTERVAL_MS 100
+static void polling_timer_handler(struct k_timer *timer);
+K_TIMER_DEFINE(polling_timer, polling_timer_handler, NULL);
 
-/* Define the accelerometer trigger */
-static struct sensor_trigger accel_trigger = {
-	.chan = SENSOR_CHAN_ACCEL_XYZ,
-	.type = SENSOR_TRIG_THRESHOLD
-};
+/* Work item for sensor reading */
+static struct k_work sensor_work;
+static void sensor_work_handler(struct k_work *work);
+
+/* Work item for LED control */
+static struct k_work led_work;
+static void led_work_handler(struct k_work *work);
 
 static void accel_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
 
@@ -49,155 +70,137 @@ BT_GATT_SERVICE_DEFINE(accel_service,
 	BT_GATT_CCC(accel_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 );
 
-/* Send inactivity notification */
-static void inactivity_timer_handler(struct k_timer *timer)
+/* LED control function - pulse when notifications are enabled */
+static void led_work_handler(struct k_work *work)
 {
-    if (!notifications_enabled || !default_conn) {
+    static bool led_increasing = true;
+    static uint16_t led_level = 0;
+    int err;
+
+    if (!device_is_ready(led_dev) || NOTIFICATION_LED >= num_leds) {
         return;
     }
 
-    uint8_t inactive_buffer[1] = {0}; /* Single byte with value 0 */
-    
-    LOG_INF("No activity detected for 5 seconds, sending inactive notification");
-    
-    int err = bt_gatt_notify(default_conn, &accel_service.attrs[1], 
-                           inactive_buffer, sizeof(inactive_buffer));
-    if (err) {
-        LOG_ERR("Failed to send inactivity notification: %d", err);
+    if (notifications_enabled) {
+        /* Create a breathing effect when notifications are enabled */
+        if (led_increasing) {
+            led_level += 5;
+            if (led_level >= MAX_BRIGHTNESS) {
+                led_level = MAX_BRIGHTNESS;
+                led_increasing = false;
+            }
+        } else {
+            if (led_level <= 5) {
+                led_level = 0;
+                led_increasing = true;
+            } else {
+                led_level -= 5;
+            }
+        }
+
+        err = led_set_brightness(led_dev, NOTIFICATION_LED, led_level);
+        if (err < 0) {
+            LOG_ERR("Failed to set LED brightness: %d", err);
+        }
+
+        /* Schedule next update */
+        k_work_submit(&led_work);
+    } else {
+        /* Turn LED off when notifications are disabled */
+        err = led_off(led_dev, NOTIFICATION_LED);
+        if (err < 0) {
+            LOG_ERR("Failed to turn LED off: %d", err);
+        }
     }
 }
 
-/* Accelerometer trigger handler */
-static void accelerometer_trigger_handler(const struct device *dev,
-                                        const struct sensor_trigger *trig)
+/* Sensor polling timer handler */
+static void polling_timer_handler(struct k_timer *timer)
+{
+    /* Submit work to the system work queue */
+    k_work_submit(&sensor_work);
+}
+
+/* Sensor work handler */
+static void sensor_work_handler(struct k_work *work)
 {
     int err = 0;
     struct sensor_value data[3];
+    uint8_t buffer[6]; /* X, Y, Z as 16-bit values */
     
-    LOG_INF("Accelerometer trigger fired! Type: %d", trig->type);
-    
-    switch (trig->type) {
-    case SENSOR_TRIG_MOTION:
-    case SENSOR_TRIG_STATIONARY:
-    case SENSOR_TRIG_THRESHOLD:
-        /* Fetch accelerometer samples */
-        if (sensor_sample_fetch(dev) < 0) {
-            LOG_ERR("Sample fetch error");
-            return;
-        }
-
-        /* Get acceleration data */
-        err = sensor_channel_get(dev, SENSOR_CHAN_ACCEL_XYZ, &data[0]);
-        if (err) {
-            LOG_ERR("sensor_channel_get, error: %d", err);
-            return;
-        }
-
-        /* Log values for debugging */
-        LOG_INF("Activity detected - X: %d.%06d, Y: %d.%06d, Z: %d.%06d", 
-                data[0].val1, data[0].val2,
-                data[1].val1, data[1].val2,
-                data[2].val1, data[2].val2);
-        
-        /* Send notification if enabled */
-        if (notifications_enabled && default_conn) {
-            uint8_t buffer[6]; /* X, Y, Z as 16-bit values */
-            
-            /* Convert to int16_t values (in milli-g) for BLE transmission */
-            int16_t x_int = (int16_t)(sensor_value_to_double(&data[0]) * 1000);
-            int16_t y_int = (int16_t)(sensor_value_to_double(&data[1]) * 1000);
-            int16_t z_int = (int16_t)(sensor_value_to_double(&data[2]) * 1000);
-
-            /* Pack into buffer (little-endian) */
-            buffer[0] = x_int & 0xFF;
-            buffer[1] = (x_int >> 8) & 0xFF;
-            buffer[2] = y_int & 0xFF;
-            buffer[3] = (y_int >> 8) & 0xFF;
-            buffer[4] = z_int & 0xFF;
-            buffer[5] = (z_int >> 8) & 0xFF;
-
-            /* Reset inactivity timer */
-            k_timer_start(&inactivity_timer, K_SECONDS(5), K_NO_WAIT);
-
-            /* Send notification */
-            err = bt_gatt_notify(default_conn, &accel_service.attrs[1], buffer, sizeof(buffer));
-            if (err) {
-                LOG_ERR("Failed to send acceleration notification: %d", err);
-            }
-        }
-        break;
-        
-    default:
-        LOG_ERR("Unknown trigger: %d", trig->type);
+    /* Only proceed if notifications are enabled and connected */
+    if (!notifications_enabled || !default_conn) {
+        return;
     }
-}
+    
+    /* Fetch accelerometer samples */
+    if (sensor_sample_fetch(adxl_dev) < 0) {
+        LOG_ERR("Sample fetch error");
+        return;
+    }
 
-/* Set activity threshold according to ADXL367 datasheet requirements */
-static int configure_activity_threshold(const struct device *dev)
-{
-    struct sensor_value threshold;
-    
-    /* Set threshold to approximately 0.5g (4.9 m/s²) */
-    /* For 2g range: 0.5g is about 1/4 of full scale */
-    threshold.val1 = 4;    /* 4 m/s² */
-    threshold.val2 = 903325; /* 4.903325 m/s² total (0.5g) */
-    
-    LOG_INF("Setting activity threshold to %d.%06d m/s²", 
-           threshold.val1, threshold.val2);
-    
-    /* The driver will convert this value to the 13-bit code needed by the hardware */
-    int err = sensor_attr_set(dev, SENSOR_CHAN_ACCEL_XYZ,
-                            SENSOR_ATTR_UPPER_THRESH, &threshold);
+    /* Get acceleration data */
+    err = sensor_channel_get(adxl_dev, SENSOR_CHAN_ACCEL_XYZ, &data[0]);
     if (err) {
-        LOG_ERR("Failed to set activity threshold: %d", err);
-        return err;
+        LOG_ERR("sensor_channel_get, error: %d", err);
+        return;
     }
+
+    /* Debug log */
+    LOG_DBG("X: %d.%06d, Y: %d.%06d, Z: %d.%06d", 
+            data[0].val1, data[0].val2,
+            data[1].val1, data[1].val2,
+            data[2].val1, data[2].val2);
     
-    LOG_INF("Activity threshold set successfully");
-    return 0;
+    /* Convert to int16_t values (in milli-g) for BLE transmission */
+    int16_t x_int = (int16_t)(sensor_value_to_double(&data[0]) * 1000);
+    int16_t y_int = (int16_t)(sensor_value_to_double(&data[1]) * 1000);
+    int16_t z_int = (int16_t)(sensor_value_to_double(&data[2]) * 1000);
+
+    /* Pack into buffer (little-endian) */
+    buffer[0] = x_int & 0xFF;
+    buffer[1] = (x_int >> 8) & 0xFF;
+    buffer[2] = y_int & 0xFF;
+    buffer[3] = (y_int >> 8) & 0xFF;
+    buffer[4] = z_int & 0xFF;
+    buffer[5] = (z_int >> 8) & 0xFF;
+
+    /* Send notification */
+    err = bt_gatt_notify(default_conn, &accel_service.attrs[1], buffer, sizeof(buffer));
+    if (err) {
+        LOG_ERR("Failed to send acceleration notification: %d", err);
+    }
 }
 
-static void start_activity_monitoring(void)
+static void start_sensor_polling(void)
 {
     if (!device_is_ready(adxl_dev)) {
         LOG_ERR("ADXL367 device not ready");
         return;
     }
     
-    LOG_INF("Starting accelerometer activity monitoring");
+    LOG_INF("Starting accelerometer polling at 10Hz");
     
-    /* Configure activity threshold */
-    int err = configure_activity_threshold(adxl_dev);
-    if (err) {
-        LOG_ERR("Failed to configure activity threshold");
-        return;
+    /* Start the polling timer */
+    k_timer_start(&polling_timer, K_MSEC(POLLING_INTERVAL_MS), K_MSEC(POLLING_INTERVAL_MS));
+    
+    /* Start LED breathing effect */
+    if (device_is_ready(led_dev) && NOTIFICATION_LED < num_leds) {
+        k_work_submit(&led_work);
     }
-    
-    /* Set trigger type to threshold detection */
-    accel_trigger.chan = SENSOR_CHAN_ACCEL_XYZ;
-    accel_trigger.type = SENSOR_TRIG_THRESHOLD;
-    
-    err = sensor_trigger_set(adxl_dev, &accel_trigger, accelerometer_trigger_handler);
-    if (err) {
-        LOG_ERR("Failed to set accelerometer trigger: %d", err);
-        return;
-    }
-    
-    LOG_INF("Accelerometer trigger set successfully");
-    
-    /* Start the inactivity timer */
-    k_timer_start(&inactivity_timer, K_SECONDS(5), K_NO_WAIT);
 }
 
-static void stop_activity_monitoring(void)
+static void stop_sensor_polling(void)
 {
-    LOG_INF("Stopping accelerometer activity monitoring");
+    LOG_INF("Stopping accelerometer polling");
     
-    /* Disable the trigger */
-    sensor_trigger_set(adxl_dev, &accel_trigger, NULL);
+    /* Stop the polling timer */
+    k_timer_stop(&polling_timer);
     
-    /* Stop the timer */
-    k_timer_stop(&inactivity_timer);
+    /* Turn off LED */
+    if (device_is_ready(led_dev) && NOTIFICATION_LED < num_leds) {
+        led_off(led_dev, NOTIFICATION_LED);
+    }
 }
 
 static void accel_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value) {
@@ -206,10 +209,10 @@ static void accel_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t valu
 	
 	if (notifications_enabled) {
 	    LOG_INF("Accel notifications enabled");
-	    start_activity_monitoring();
+	    start_sensor_polling();
 	} else {
 	    LOG_INF("Accel notifications disabled");
-	    stop_activity_monitoring();
+	    stop_sensor_polling();
 	}
 }
 
@@ -227,8 +230,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
     LOG_INF("Device disconnected (reason: %u)", reason);
     
     if (notifications_enabled) {
-        /* Stop accelerometer monitoring if active */
-        stop_activity_monitoring();
+        /* Stop sensor polling if active */
+        stop_sensor_polling();
         notifications_enabled = false;
     }
     
@@ -241,8 +244,16 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.disconnected = disconnected,
 };
 
-static int accel_service_init(void) {
+static int accel_service_init(void)
+{
 	int err;
+	
+	/* Initialize work items */
+	k_work_init(&sensor_work, sensor_work_handler);
+	k_work_init(&led_work, led_work_handler);
+	
+	/* Delay startup to let other components initialize */
+	k_msleep(5000);
 	
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
 		settings_load();
@@ -255,6 +266,18 @@ static int accel_service_init(void) {
 	}
 	
 	LOG_INF("ADXL367 device is ready");
+	
+	/* Check if LED device is ready */
+	if (!device_is_ready(led_dev)) {
+	    LOG_WRN("LED device not ready");
+	} else if (num_leds > 0) {
+	    LOG_INF("LED device ready with %d LEDs", num_leds);
+	    
+	    /* Turn LED off initially */
+	    if (NOTIFICATION_LED < num_leds) {
+	        led_off(led_dev, NOTIFICATION_LED);
+	    }
+	}
 	
 	err = bt_enable(NULL);
 	if (err < 0) {
@@ -283,4 +306,5 @@ static int accel_service_init(void) {
 	return 0;
 }
 
+/* Initialize as application with high priority (99) */
 SYS_INIT(accel_service_init, APPLICATION, 99);

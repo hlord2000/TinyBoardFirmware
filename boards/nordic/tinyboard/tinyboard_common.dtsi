@@ -63,7 +63,7 @@ dmic_dev: &pdm20 {
 	adxl366: adxl366@1d {
 		compatible = "adi,adxl367";
 		reg = <0x1d>;
-		odr = <5>;
+		odr = <1>;
 		int1-gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>;
 	};
 };
